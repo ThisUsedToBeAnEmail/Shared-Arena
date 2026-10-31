@@ -1,0 +1,300 @@
+package Shared::Arena::Map;
+
+use 5.010;
+use strict;
+use warnings;
+
+our $VERSION = '0.16';
+
+require Shared::Arena;
+
+1;
+
+__END__
+
+=encoding utf8
+
+=head1 NAME
+
+Shared::Arena::Map - a fixed-capacity map several processes share
+
+=head1 VERSION
+
+Version 0.11
+
+=head1 SYNOPSIS
+
+    my $arena = Shared::Arena->create(size => 8 * 1024 * 1024);
+    my $map   = $arena->map('cache', slots => 4096, slot_size => 512);
+
+    $map->store('user:42', $blob);
+    my ($blob) = $map->fetch('user:42');
+
+    # counters are one atomic, so a rate limit costs nothing to share
+    my $hits = $map->incr("rate:$ip");
+
+=head1 DESCRIPTION
+
+A map in an arena, written and read by any number of processes. Reads take no
+lock. Writes take one of a stripe of locks, so two writers touching different
+keys almost never meet.
+
+Get one from C<< $arena->map($name) >>. Every process can ask for the same name
+with the same arguments; the first creates it and the rest attach.
+
+Keys and values are both arbitrary bytes. Neither is interpreted, and both may
+contain anything, including NUL. A key must not be empty; a value may be. A
+map made with C<< serialise => 1 >> is the exception for values; see below.
+
+=head2 It has a fixed size, and does not grow
+
+The table is sized once and never rehashes. Growing a table that other
+processes are reading means moving entries they are part-way through looking
+for, and the only safe ways to do that are to stop every process or to keep two
+tables alive until the last reader has left. Neither belongs in something whose
+whole appeal is that a read is a hash and a compare.
+
+So a full table B<refuses> a new key and C<store> returns 0. Watch C<used>
+against C<capacity>, and size the table for the worst case you will accept.
+
+Overwriting a key that is already there always works, full table or not: it
+needs no new slot.
+
+=head2 What deleting leaves behind
+
+A deleted entry becomes a tombstone rather than an empty slot, and this is not
+an implementation detail a caller can ignore. An empty slot ends a search, so
+turning a deleted entry into one would make every key stored past it
+unreachable. The tombstone keeps the path open.
+
+Tombstones are reused by the next key that lands on one, but they are never
+swept. A workload that deletes constantly will accumulate them and start
+refusing keys while C<used> still looks low. C<tombstones> is in the stats so
+that is a number rather than a mystery. If you are churning keys, size for
+C<used + tombstones>, or use a fresh map.
+
+=head2 Reading while somebody writes
+
+A value can be replaced while another process is reading it. Each entry carries
+a version, so a reader that copied a value while it was being replaced notices
+and tries again.
+
+A reader that keeps losing gives up after a bounded number of attempts. It
+reports the key as B<not readable>, which C<fetch> spells as an empty list, and
+counts a C<busy>. B<A non-zero C<busy> does not mean a key was missing>: it
+means a fetch gave up on an entry that may well be there. It should be rare
+enough to be interesting.
+
+=head2 Serialised values
+
+    my $map = $arena->map('routes', slots => 4096, serialise => 1);
+
+    $map->store($host, { upstream => $u, weight => 3 });
+    my ($route) = $map->fetch($host);
+
+By default a value is B<bytes>: a reference is stringified going in and comes
+out as C<HASH(0x...)>, and a string's UTF-8 flag does not survive. With
+C<< serialise => 1 >> a value is any Perl structure, encoded through
+L<Struct::Codec> on the way in and decoded on the way out, and what comes back
+is the same structure: strings stay strings and numbers stay numbers, the
+UTF-8 flag survives, a blessed referent is blessed into the same class, and
+references that were shared or cyclic are shared or cyclic again. Every
+process gets its own copy; nothing is read in place, which is what
+L<Shared::Arena::Frozen> is for.
+
+Keys are bytes either way. A value that cannot be encoded, a closure for one,
+croaks with the codec's reason and stores nothing. A value whose encoding does
+not fit a slot is refused exactly as an oversized byte value is, so C<store>
+answers -1 for both. A corrupt slot makes C<fetch> croak rather than hand back
+bytes as if they were a value.
+
+C<incr> croaks on a serialised map and C<counter> answers C<undef>: a counter
+is a raw word and cannot also be an encoded value. C<exists>, C<delete> and
+C<keys> are unchanged.
+
+The flag is part of the map's B<shape>, kept in the shared header beside
+C<slot_size>, because a map one process treats as encoded and another treats
+as bytes is two maps that disagree about every value. Every process must ask
+for the same setting, and one that asks for the other is refused as a
+different C<slot_size> would be.
+
+=head1 METHODS
+
+=head2 store
+
+    my $rc = $map->store($key, $value);
+    my $rc = $map->store($key, $value, ttl => 300);      # seconds
+    my $rc = $map->store($key, $value, ttl_ms => 5000);  # milliseconds
+
+1 when stored, 0 when the table is full, -1 when the key is empty or the pair
+does not fit a slot.
+
+On a serialised map C<$value> is any structure, and -1 also answers one whose
+encoding does not fit. A value that cannot be encoded croaks.
+
+A C<ttl> gives the entry a deadline. After it, the key reads as B<absent> from
+every process - C<fetch> returns an empty list and C<exists> returns false -
+because the deadline is a wall-clock timestamp stored in the entry, not
+per-process state. Without one the entry lives until it is deleted or
+overwritten.
+
+This is the difference between a map and a denylist, a nonce store, or a dedup
+window. Doing it by hand - storing an expiry beside the value and checking it on
+every read - works until the day a caller forgets the check, and a forgotten
+expiry check turns every ban permanent. Here the map keeps the deadline.
+
+B<Expiry is lazy.> A lapsed entry is not swept in the background; it is
+collected by the next C<fetch> or C<exists> that lands on it, which turns the
+slot into a tombstone the next insert can reuse. An entry nobody looks at again
+sits until an insert probes over it. C<stats> reports C<expired>, the running
+count of entries collected this way, so a table full of stale keys is visible
+rather than mysterious.
+
+A re-C<store> of a key sets a fresh deadline, so touching an entry renews it.
+
+The clock is read only when a deadline is involved, so a map that never passes
+a C<ttl> pays nothing for the feature.
+
+=head2 fetch
+
+    my ($value) = $map->fetch($key);
+
+The value, or an B<empty list> when the key is not there. Not C<undef>: C<undef>
+is a value a caller may legitimately store, and a door that used it to mean
+absent could not tell the two apart. Use C<exists> to ask the other question.
+
+On a serialised map the structure comes back decoded, a fresh copy each call.
+
+=head2 exists
+
+    if ($map->exists($key)) { ... }
+
+=head2 delete
+
+    my $was_there = $map->delete($key);
+
+Returns 1 if the key was there and is now gone, 0 if it was not there, and
+C<undef> if another writer held the key for long enough that this call gave up.
+Both of the last two are false, so a delete whose answer you ignore behaves as
+it always did; C<defined> is what separates "it was not there" from "ask again".
+
+The difference matters to a caller that deletes in order to B<rely> on the key
+being gone - clearing a window counter before a fresh burst, say. Reading a
+refusal as success there carries the old window's state into the new one.
+
+=head2 incr
+
+    my $now = $map->incr($key);
+    my $now = $map->incr($key, $by);
+    my $now = $map->incr($key, $by, ttl => 60);         # seconds
+    my $now = $map->incr($key, $by, ttl_ms => 60_000);  # milliseconds
+
+Adds to a counter, creating it at C<$by> when the key is absent, and returns the
+new value. C<$by> may be negative. Returns C<undef> when the table is full, when
+the key holds something that is not a counter, or when another writer held the
+key for long enough that this call gave up.
+
+B<A C<undef> is a count that did not happen.> The last of those three is
+transient and worth retrying; the other two will answer the same way next time.
+C<stats> tells them apart - a refused write counts C<busy>, a full table counts
+C<full> - and a caller that needs every hit recorded should check the return
+rather than call C<incr> in void context.
+
+A C<ttl> gives the counter a deadline B<when this call creates it, or resets
+one that has lapsed>, and never otherwise: a live counter keeps the deadline it
+was created with whatever a later C<incr> passes. That is a fixed window in one
+call. The first hit of a window starts it, every hit inside it counts against
+the same deadline, and the first hit after it starts the next one at C<$by>. A
+C<ttl> on every call does not slide the window, which is the mistake this is
+shaped to make impossible.
+
+This is the one operation that does not go through the version at all: a counter
+is a single machine word, so the addition is one atomic instruction and cannot
+be seen half-done. A shared rate limit costs about what incrementing a variable
+costs.
+
+Two hundred processes incrementing one key all land, as long as each of them
+waits for its turn - which is what the return value is for. The write waits out
+an ordinary preemption by the process holding the key and then refuses rather
+than waiting for ever, because a writer that died holding it must not wedge
+everybody after it.
+
+A key holding a value that is not a counter is refused rather than
+reinterpreted. Storing a string and then counting on it is a bug, and quietly
+overwriting the string would hide both the bug and the string.
+
+A counter whose TTL has lapsed is treated as gone: the next C<incr> starts it
+fresh at C<$by> rather than adding to the stale value. A window counter and its
+deadline stay consistent without the caller resetting anything.
+
+Croaks on a serialised map.
+
+=head2 counter
+
+    my $n = $map->counter($key);
+
+A counter's value without changing it, or C<undef> when the key is absent or
+holds something else. Always C<undef> on a serialised map.
+
+=head2 serialised
+
+    if ($map->serialised) { ... }
+
+Whether this map was made with C<< serialise => 1 >>.
+
+=head2 keys
+
+    my @keys = $map->keys;
+
+Every live key, in the table's own order, which is neither insertion order nor
+sorted.
+
+B<A snapshot, not a lock.> Entries may be added or removed while this walks, so
+a key it returns may be gone by the time you use it, and one added behind the
+walk will not appear. It is for looking at a table, not for iterating one that
+is being written.
+
+=head2 stats
+
+    my %s = $map->stats;
+    # used, capacity, tombstones, busy, full, expired
+
+C<busy> counts the operations that gave up waiting: a read that kept losing the
+race with a writer, and a write whose key was held by another process for the
+whole wait. C<full> counts only writes refused for want of a slot. The two are
+separate because they call for opposite responses - C<busy> says try again,
+C<full> says the table is too small - and a C<busy> that keeps climbing on a
+write-heavy map is many processes queueing on one key.
+
+=head2 max_pair, capacity
+
+    my $bytes = $map->max_pair;    # key + value that fits one slot
+    my $slots = $map->capacity;
+
+=head1 SIZING A MAP
+
+    my $map = $arena->map('cache', slots => 4096, slot_size => 512);
+    my $map = $arena->map('routes', slots => 4096, serialise => 1);
+
+C<slots> is the number of entries, and there is no load factor to leave room
+for beyond your own: an open-addressed table slows down as it fills, so leave
+headroom rather than sizing it exactly. C<slot_size> bounds a key and its value
+together; ask C<max_pair> rather than working it out.
+
+A map costs C<slots * slot_size> bytes for its life, used or not.
+
+=head1 SEE ALSO
+
+L<Shared::Arena>, L<Shared::Arena::Ring>, L<Struct::Codec>.
+
+=head1 AUTHOR
+
+LNATION, C<< <email at lnation.org> >>
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2026 by LNATION.
+
+This is free software, licensed under the Artistic License 2.0.
+
+=cut

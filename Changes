@@ -1,0 +1,151 @@
+Revision history for Shared::Arena
+
+0.16	2026-10-11
+        - Builds on 5.10.0: mXPUSHs is defined where perl lacks it.
+        - FIXES the Windows build: GetTickCount64 did not link under MSVC or
+          Strawberry. Intervals read QueryPerformanceCounter.
+
+0.15	2026-10-11
+        - FIXES a scoreboard row and a lease bind refused as "full" for a held
+          stripe: both wait as a carve does and answer busy.
+        - Lease acquire, renew and release wait for a held stripe as a map
+          write does.
+        - Intervals read CLOCK_MONOTONIC where Makefile.PL finds one running,
+          so a wall-clock step neither stalls nor refills a rate bucket.
+        - FIXES t/32-map-ttl.t timing a deadline by its sleep.
+
+0.14	2026-10-05
+        - FIXES a map write dropped under contention: a store, incr or delete
+          whose stripe was held burned 100k test-and-sets and gave up. A
+          FreeBSD smoker counted 38 of 40 and an Alpine one 999 of 1000, in a
+          table of 64 slots holding six keys.
+        - The write path's wait escalates, 50us to 2ms over ~10ms, as the carve
+          path's has since 0.13. Shorter than the carve path's two seconds on
+          purpose: a store is on a per-request path.
+        - A write refused for a held stripe answers SA_MAP_STORE_BUSY (-3) and
+          counts `busy`. It answered SA_MAP_STORE_FULL before, and incremented
+          no statistic at all, so `stats` showed a clean map while writes went
+          missing: full means stop, busy means try again.
+        - Map->delete returns undef for a refused stripe, 0 for a key that was
+          not there. Both false, so a speculative delete is unaffected.
+        - FIXES t/32-map-ttl.t asserting a count from an unmeasured window: the
+          burst after the deadline has to fit inside the ttl it counts inside.
+
+0.13	2026-09-22
+        - FIXES two carves refused in four thousand on a loaded FreeBSD 15
+          smoker, with room in the arena for all of them. 
+        - A carve refused for a held stripe answers SA_E_BUSY, not SA_E_FULL:
+          one means try again, the other means stop.
+        - Add Shared::Arena::_last_err: why the last ->region returned empty.
+        - FIXES t/32-map-ttl.t counting three hits where it asked for two.
+
+0.12	2026-09-20
+        - FIXES a waker slot outliving its owner. Nothing released a slot when
+          a process was killed or _exits, so `live` stayed set for a process
+          that was gone and the next taker of that index was refused 
+
+0.11	2026-09-19
+        - Add wake_init, wake_take, wake_fd and wake_drained to the C ABI (4).
+        - Add map_incr_ttl to the C ABI and ttl => to Map->incr: a fixed window in one call.
+        - Add rate_counts to the C ABI.
+        - Add map_incr_at to the C ABI (5): map_incr_ttl on the caller's clock.
+        - A counter under the stripe lock is a load and a store, not an atomic add.
+        - Publish SA_READ_*, SA_MAP_STORE_*, SA_CACHE_*, SA_ERR_* and SA_TYPE_* in sa_abi.h.
+        - Add Shared::Arena::_region_ptr.
+        - A drain or claim at a hole never sleeps; Cursor->drain takes wait => 0.
+        - A publish walks only the wakers that have pipes, and no registry when there are none.
+        - The peer row is written with stores on publish, not read-modify-writes.
+        - Deadlines read CLOCK_REALTIME_COARSE where it exists.
+        - FIXES a region with a lease refusing wakers: the registry compared
+          reserved names only up to their leading NUL.
+
+0.10	2026-09-19
+        - FIXES six files failing at once on the FreeBSD 5.14 and 5.16 smokers:
+          Makefile.PL's pthread_atfork probe only linked, and FreeBSD's libc
+          stub links and never runs without libthr, so a child kept its
+          parent's cached pid. The probe now forks and requires the child
+          handler to have run, linking -lpthread where that is what it takes.
+          t/06-fork.t asserts it first, through a _pid probe.
+        - FIXES the ABI selftest (step 25) on 32-bit Linux: the HyperLogLog
+          estimates compared unequal under x87 excess precision. Now volatile.
+        - FIXES t/32-map-ttl.t on a perl without 64-bit integers: pack 'Q'.
+
+0.09	2026-09-17
+        - FIXES a panic on every DEBUGGING perl: Map's stats reserved ten
+          stack slots with EXTEND(SP, 10) and pushed twelve (six pairs), so
+          t/14 and t/32 aborted after their assertions passed. A non-DEBUGGING
+          perl overran the stack silently. Now reserves twelve.
+
+0.08	2026-09-16
+        - Add serialise => 1 to Cache and Map: a value can now be any Perl structure
+          and comes back as the same structure, through Struct::Codec, which is
+          now a prerequisite. 
+
+0.07	2026-09-16
+        - FIXES a smoker FAIL in t/08-mpsc.t. It asserted that two children's
+          sequence ranges overlapped, which is the host's scheduling and not
+          the ring's promise: where the storm is shorter than a timeslice the
+          children run one after another. It now asserts what the sequence
+          counter guarantees - every child published and was handed a range at
+          least as wide as its records - and reports the overlap. The children
+          give the processor up a few times mid-loop so that they interleave
+          on a host that cannot run them at once.
+        - t/08-mpsc.t no longer requires the reader to have been lapped, which
+          is the same kind of guess; it requires that nothing went missing
+          quietly.
+
+0.05	2026-09-15
+        - FIXES the build on a C89 compiler, gcc 4.2.1 on the FreeBSD 9 smoker,
+          which refused 0.03 and 0.04 with "redefinition of typedef": four
+          tenants typedef-named their struct where the ABI header forward
+          declares it.i
+
+0.04	2026-09-11
+        - Add Shared::Arena::HyperLogLog, how many distinct keys in a few
+          kilobytes: an add is a lock-free max, so a pool shares one sketch
+          with nothing to contend on, and two sketches merge into their union.
+        - ABI version 3.
+        - FIXES two smoker FAILs on a two-processor box. t/22-cache.t let
+          children churn while a sibling was still reading; they now wait
+          until every read is reported. t/08-mpsc.t asserted the READER saw
+          several children, which needs the parent scheduled mid-storm; it
+          now asserts the children's sequence ranges overlapped.
+
+0.03	2026-09-11
+        - Add Shared::Arena::Cuckoo, a shared filter that can remove a key.
+        - Add Shared::Arena::Scoreboard, one row per worker published live:
+          each worker writes its own row with no lock, a supervisor reads the
+          whole board in one pass
+        - Add Shared::Arena::Lease, leader election: one holder at a time and
+          a successor when the holder dies, with a fencing token.
+        - Shared::Arena::Map store takes ttl / ttl_ms, a per-key deadline after
+          which the key reads as absent everywhere; expiry is lazy and counted
+          in the new `expired` stat, and an expired counter resets on incr.
+        - Cache reads scale across processes. A hit wrote a counter every
+          process shares; counts are now published every 64. Eight processes
+          reading one key: 530ns a get before, 87ns now.
+        - A cache get reads the clock only for an entry with a ttl, and a get
+          or fetch no longer allocates on a miss. A cache miss: 51ns to 29ns.
+        - FIXES a double free under ithreads: a new thread cloned every handle
+          and freed it on exit, unmapping the arena under its creator. Handles
+          are no longer cloned; a thread attaches by name.
+
+0.02    2026-09-11
+        - FIXES the Windows FAIL in 0.01. Three test files forked without
+          skipping on MSWin32, where fork is emulated with threads: a child
+          calling exit ends the whole file, so every assertion passed, no plan
+          was printed, and the harness called it a FAIL.
+        - FIXES a test that failed 9 runs in 12 on a two-processor container
+          and 0 in 12 here. It had four children write 2000 churn keys into a
+          512-entry cache to force eviction, then asserted an entry written
+          before that churn had survived it. The children report through a
+          pipe now; eviction is still asserted, where it belongs.
+        - FIXES carving a region being refused under contention. The stripe
+          lock is a pure spin, so with more carvers than cores the budget
+          burned while the holder was not scheduled
+        - FIXES a test using pack('Q<'), which is a fatal "Invalid type" on a
+          perl built with ivsize=4.
+
+
+0.01    2026-09-10
+        - First version.
